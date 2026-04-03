@@ -2,3 +2,6 @@ papers.txt
 papers.json
 __pycache__/
 *.pyc
+ebsco_downloader/downloads/
+ebsco_downloader/storage_state.json
+ebsco_downloader/progress.json
