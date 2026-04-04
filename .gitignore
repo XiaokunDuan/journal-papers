@@ -2,6 +2,13 @@ papers.txt
 papers.json
 __pycache__/
 *.pyc
+.DS_Store
 ebsco_downloader/downloads/
 ebsco_downloader/storage_state.json
 ebsco_downloader/progress.json
+ebsco_downloader/progress*.json
+ebsco_downloader/todo*.json
+ebsco_downloader/todo_snapshot*.json
+ebsco_downloader/*.log
+ebsco_downloader/chrome_user_data/
+ebsco_downloader/manual_chrome_profile/
