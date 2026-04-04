@@ -10,5 +10,9 @@ ebsco_downloader/progress*.json
 ebsco_downloader/todo*.json
 ebsco_downloader/todo_snapshot*.json
 ebsco_downloader/*.log
+ebsco_downloader/.tmp_*
+ebsco_downloader/tmp_*
+ebsco_downloader/cnp_profile_*/
+ebsco_downloader/diagnose*.py
 ebsco_downloader/chrome_user_data/
 ebsco_downloader/manual_chrome_profile/
