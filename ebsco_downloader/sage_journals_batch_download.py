@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import re
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
-from urllib.request import Request, build_opener
 
 from playwright.async_api import (
     Browser,
@@ -25,6 +24,7 @@ from download_naming import extract_doi_suffix, paper_key, target_exists, target
 
 ROOT = Path(__file__).resolve().parent
 DOWNLOAD_DIR = ROOT / "downloads"
+SYSTEM_DOWNLOADS_DIR = Path.home() / "Downloads"
 PROGRESS_FILE = ROOT / "progress_sage_journals.json"
 PAPERS_FILE = ROOT.parent / "papers.json"
 SUPPORTED_JOURNALS = {"POM"}
@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def normalize_search_text(value: str) -> str:
+    value = html.unescape(value)
     value = (
         value.replace("‐", "-")
         .replace("–", "-")
@@ -262,34 +263,113 @@ async def build_cookie_header(context: BrowserContext) -> str:
     return "; ".join(f"{item['name']}={item['value']}" for item in cookies)
 
 
-def download_via_http(url: str, cookie_header: str, referer: str, destination: Path) -> None:
+def snapshot_downloads() -> dict[str, tuple[float, int]]:
+    snapshot: dict[str, tuple[float, int]] = {}
+    if not SYSTEM_DOWNLOADS_DIR.exists():
+        return snapshot
+    for path in SYSTEM_DOWNLOADS_DIR.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        snapshot[path.name] = (stat.st_mtime, stat.st_size)
+    return snapshot
+
+
+def candidate_new_downloads(before: dict[str, tuple[float, int]]) -> list[Path]:
+    if not SYSTEM_DOWNLOADS_DIR.exists():
+        return []
+    result: list[Path] = []
+    for path in SYSTEM_DOWNLOADS_DIR.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        prev = before.get(path.name)
+        if prev is None or prev != (stat.st_mtime, stat.st_size):
+            result.append(path)
+    result.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return result
+
+
+def title_tokens(title: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[0-9a-z]+", normalize_search_text(title).casefold())
+        if len(token) >= 3
+    }
+
+
+def matching_downloads_for_paper(paper: dict[str, Any]) -> list[Path]:
+    if not SYSTEM_DOWNLOADS_DIR.exists():
+        return []
+    expected_year = str(paper.get("year", "")).strip()
+    expected_tokens = title_tokens(str(paper.get("title", "")))
+    if not expected_tokens:
+        return []
+    matches: list[Path] = []
+    for path in SYSTEM_DOWNLOADS_DIR.iterdir():
+        if not path.is_file() or path.suffix.lower() != ".pdf":
+            continue
+        try:
+            stem_tokens = {
+                token for token in re.findall(r"[0-9a-z]+", path.stem.casefold()) if len(token) >= 3
+            }
+        except OSError:
+            continue
+        overlap = len(expected_tokens & stem_tokens)
+        if overlap < 4:
+            continue
+        if expected_year and expected_year not in stem_tokens:
+            continue
+        matches.append(path)
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches
+
+
+async def click_and_capture_download(page: Page, paper: dict[str, Any], destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = destination.with_name(f".{destination.name}.part")
-    if temp_path.exists():
-        temp_path.unlink()
-    req = Request(
-        url,
-        headers={
-            "Cookie": cookie_header,
-            "Referer": referer,
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
-        },
-    )
-    opener = build_opener()
-    with opener.open(req, timeout=45) as resp:
-        content_type = resp.headers.get("Content-Type", "")
-        data = resp.read()
-    if not data.startswith(b"%PDF-"):
-        preview = data[:200].decode("utf-8", errors="ignore")
-        raise RuntimeError(
-            f"PDF_NOT_RETURNED: content-type={content_type!r}, preview={preview!r}"
-        )
-    temp_path.write_bytes(data)
-    temp_path.replace(destination)
+    before = snapshot_downloads()
+    # Intentionally use the visible reader control instead of fetching its href directly.
+    download = page.locator('a[aria-label="Download PDF"]').first
+    await download.wait_for(state="visible", timeout=20000)
+    await download.scroll_into_view_if_needed()
+    click_started = asyncio.get_running_loop().time()
+    await download.click(timeout=15000)
+    deadline = click_started + 120
+    stable_sizes: dict[str, tuple[int, int]] = {}
+    while asyncio.get_running_loop().time() < deadline:
+        for path in candidate_new_downloads(before):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_mtime < click_started:
+                continue
+            if path.suffix == ".crdownload":
+                continue
+            if stat.st_size <= 0:
+                continue
+            prev = stable_sizes.get(path.name)
+            if prev is None or prev[0] != stat.st_size:
+                stable_sizes[path.name] = (stat.st_size, 1)
+                continue
+            stable_sizes[path.name] = (stat.st_size, prev[1] + 1)
+            if path.suffix.lower() == ".pdf" and stable_sizes[path.name][1] >= 2:
+                destination.write_bytes(path.read_bytes())
+                return
+            if stable_sizes[path.name][1] >= 3:
+                destination.write_bytes(path.read_bytes())
+                return
+        await asyncio.sleep(1)
+    for path in matching_downloads_for_paper(paper):
+        destination.write_bytes(path.read_bytes())
+        return
+    raise RuntimeError("DOWNLOAD_NOT_CAPTURED: browser click did not produce a saved PDF")
 
 
 async def open_search_results(page: Page, query: str) -> None:
@@ -342,50 +422,80 @@ async def wait_briefly(page: Page, timeout_ms: int = 8000) -> None:
         pass
 
 
+async def wait_for_epub_ready(page: Page, timeout_ms: int = 30000) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000.0
+    while True:
+        title = await page.title()
+        if title.strip() and title.strip() != "Just a moment...":
+            download = page.locator('a[aria-label="Download PDF"]').first
+            if await download.count():
+                try:
+                    if await download.is_visible():
+                        return
+                except PlaywrightError:
+                    pass
+            body = await page.locator("body").inner_text()
+            if "Production and Operations Management" in body and "Abstract" in body:
+                return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(
+                f"epub page did not become ready; title={title!r}; url={page.url}"
+            )
+        await asyncio.sleep(1)
+
+
 async def article_to_reader_url(page: Page, doi_suffix: str) -> str:
     full_url = f"https://{SAGE_HOST}/doi/full/{doi_suffix}"
     await page.goto(full_url, wait_until="domcontentloaded", timeout=45000)
     await wait_briefly(page)
+    # Intentionally click the article-page PDF/EPUB control to follow the real site flow.
     reader = page.locator('a[data-id="article-toolbar-pdf-epub"]').first
     await reader.wait_for(timeout=15000)
     href = await reader.get_attribute("href")
     if not href:
         raise RuntimeError(f"no PDF/EPUB href on article page for {doi_suffix}")
-    return href_to_absolute(href)
+    before_url = page.url
+    await reader.click()
+    try:
+        await page.wait_for_url(re.compile(r"/doi/(reader|epub)/"), timeout=15000)
+    except PlaywrightTimeoutError:
+        await page.goto(href_to_absolute(href), wait_until="domcontentloaded", timeout=45000)
+        await wait_briefly(page)
+    if page.url == before_url:
+        raise RuntimeError(f"click on PDF/EPUB did not navigate for {doi_suffix}")
+    return page.url
 
 
-async def resolve_download_url(page: Page, doi_suffix: str) -> tuple[str, str]:
+async def prepare_epub_page(page: Page, doi_suffix: str) -> None:
     reader_url = await article_to_reader_url(page, doi_suffix)
-    await page.goto(reader_url, wait_until="domcontentloaded", timeout=45000)
-    await wait_briefly(page)
+    if page.url != reader_url:
+        await page.goto(reader_url, wait_until="domcontentloaded", timeout=45000)
+        await wait_briefly(page)
     if "/doi/epub/" not in page.url and "/doi/reader/" in page.url:
         await page.goto(f"https://{SAGE_HOST}/doi/epub/{doi_suffix}", wait_until="domcontentloaded", timeout=45000)
         await wait_briefly(page)
-    download = page.locator('a[aria-label="Download PDF"]').first
-    await download.wait_for(timeout=20000)
-    href = await download.get_attribute("href")
-    if not href:
-        raise RuntimeError(f"no Download PDF href on epub page for {doi_suffix}")
-    return href_to_absolute(href), page.url
+    await wait_for_epub_ready(page)
+    await page.locator('a[aria-label="Download PDF"]').first.wait_for(state="visible", timeout=20000)
 
 
 async def process_one_paper(context: BrowserContext, paper: dict[str, Any]) -> None:
     destination = target_path(DOWNLOAD_DIR, paper)
     if destination.exists():
         return
+    existing = matching_downloads_for_paper(paper)
+    if existing:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(existing[0].read_bytes())
+        return
     doi = str(paper.get("doi", "")).strip()
     title = str(paper.get("title", "")).strip()
     page = await context.new_page()
     try:
         doi_suffix = await search_result_doi(page, title, doi)
-        download_url, referer = await resolve_download_url(page, doi_suffix)
+        await prepare_epub_page(page, doi_suffix)
+        await click_and_capture_download(page, paper, destination)
     finally:
         await page.close()
-    cookie_header = await build_cookie_header(context)
-    await asyncio.wait_for(
-        asyncio.to_thread(download_via_http, download_url, cookie_header, referer, destination),
-        timeout=60,
-    )
 
 
 async def process_with_retry(context: BrowserContext, paper: dict[str, Any], retries: int = 1) -> None:
@@ -437,7 +547,7 @@ async def run_mode(args: argparse.Namespace) -> None:
                 await process_with_retry(context, paper)
                 mark_done(progress_file, progress, paper)
                 print(f"  saved -> {destination}")
-            except (PlaywrightTimeoutError, PlaywrightError, RuntimeError, HTTPError, URLError, Exception) as exc:
+            except (PlaywrightTimeoutError, PlaywrightError, RuntimeError, Exception) as exc:
                 print(f"  failed -> {type(exc).__name__}: {exc}")
                 mark_failed(progress_file, progress, paper, f"{type(exc).__name__}: {exc}")
                 if "400" in str(exc):
